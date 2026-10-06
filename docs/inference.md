@@ -4,6 +4,11 @@ How the repository's own stack renders: the entry points, the configs, the kerne
 
 ## Entry points
 
+For the opt-in single-GPU BF16 CPU-offload path, local/offline commands, measured
+RTX 5090 results, and optional separate prompt encoding, see the
+[RTX 5090 guide](rtx5090.md). The generic memory-policy default remains legacy;
+CPU offload is not an eight-GPU distributed configuration.
+
 | Script | What it does |
 |---|---|
 | [src/inference/infer.py](../src/inference/infer.py) | one GPU |

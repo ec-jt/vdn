@@ -1,0 +1,72 @@
+SGLang VDN-H3 delta-factor port
+=============================
+
+This component contains modified Apache-2.0 source from SGLang contributors.
+The upstream license includes: Copyright 2023-2024 SGLang Team.
+The full unmodified upstream license is in SGLang-LICENSE.txt.
+
+Repository: https://github.com/sgl-project/sglang
+PR: https://github.com/sgl-project/sglang/pull/37903
+Pinned merge: ff1ce11348673eea9b51165bd6b2da7238c958b4
+PR head: 330ab119ce5396e2ffc1b4b98d0c02e1181239e6
+Author-associated inverse contribution: Haocheng Xi,
+17b59d6af32692324f04a3e89a9fe615f9a3abae.
+PR submitted by Kevin Mi (kevin-mii), with additional SGLang contributors.
+This attribution does not claim exclusive authorship by the paper authors.
+
+Source paths relative to the pinned repository and SHA-256 of evidence bytes:
+
+python/sglang/kernels/jit/csrc/diffusion/vdn_delta_factors.cuh
+a135d37b14ea8e9002c92d1e892336c43c875dd0fc93572e835ed588d5a008a0
+python/sglang/kernels/ops/diffusion/attention/vdn_delta_factors_jit.py
+6d61b061126258833f8ffafb62c7cfc1a049dcad87346d355363ff03ba91dac2
+test/registered/kernel/diffusion/test_vdn_delta_factors.py
+32ec9741872a85eb24c1643cee3426cd7575aa04a1061b2384168afbeac31f4f
+LICENSE
+1495e1e757ef4d0925a2350563cf5754bb23c51701a8ec4fb3c5cdcbedae6747
+
+Local evidence: artifacts/rtx5090/paper-stack-20261005/evidence/sglang-merge/
+Research and attribution: artifacts/rtx5090/paper-stack-20261005/PROVENANCE.md
+The inspected saved repository tree contains no root NOTICE file. This file is
+the port's attribution notice, not a purported verbatim upstream NOTICE.
+
+Modifications dated 2026-10-05:
+- src/models/ops/csrc/vdn_delta_factors.cuh retains the CUDA device arithmetic,
+  tiling, two-pivot Gauss-Jordan schedule, reciprocal refinement, packed FFMA2
+  on SM100+, scalar FP32 FMA on earlier SMs, and injection GEMM. Replaced SGLang
+  includes and device annotation macro with CUDA headers/annotations; renamed
+  the namespace; removed the TVM host wrapper. Original SPDX and math comments
+  are retained.
+- src/models/ops/csrc/vdn_delta_factors.cpp and vdn_delta_factors.cu replace
+  TVM FFI with PyTorch bindings, validation/allocation, current-device/current-
+  stream launch, checked resource opt-in and thread-safe per-device setup.
+- src/models/linear_attention/paper_factor.py adapts alignment and factor
+  orientation into a strict, lazy PyTorch extension API with optional alpha.
+  Unlike the upstream model dispatch it has no fallback or training path.
+- tests/test_paper_stack_vda_factor.py adapts normalized-statistics and offset
+  test ideas, replaces model/eager dependencies with independent CPU FP64 right
+  solves, and adds contract, orientation, stream and ownership tests.
+
+Contract: transition = diag(alpha) (I + A)^-1; injection = B (I + A)^-1.
+No alpha means identity row scaling. A must make I + A SPD. Numerical/pivot
+preconditions are not checked, as in the upstream nonpivoting kernel.
+64 KiB dynamic plus 4 KiB static shared memory, 256 threads per 128x128 matrix.
+No SGLang runtime, TVM FFI, weights or transitive SGLang dependencies are bundled.
+This source port makes no new performance, accuracy or whole-model parity claim.
+
+Additional VDA stack source from the same pinned merge:
+python/sglang/kernels/ops/diffusion/attention/vdn_linear_branch_triton.py
+747fdfc1817d6d7c33aaf710ebc2c6887259ed6552565d1bf34875c19a034a1d
+python/sglang/multimodal_gen/runtime/models/dits/minimax_h3_vdn.py
+ac3b7aaff8b77bb722498ae903b8412511959a6606fe3e3863c424639040b89f
+
+- src/models/linear_attention/paper_sglang.py vendors the former file unchanged
+  below a local SPDX/provenance header. Preparation, gather, and epilogue kernels
+  execute directly; unused upstream dispatch/prologue helpers remain for fidelity.
+- src/models/linear_attention/paper_stack.py adapts the latter's affine chunk and
+  prompt factor-batch semantics. Joint A/B statistics, boundary-plan compression,
+  Triton parallel composition and single-launch bidirectional scan are new local
+  implementations, not present verbatim in upstream. Gather uses the upstream
+  device kernel with compact indices. Spatial convolution stays on cuDNN.
+- paper_factor.py directly invokes installed C++/CUDA compilers to build its
+  PyTorch extension because Ninja is absent. It installs no build dependencies.

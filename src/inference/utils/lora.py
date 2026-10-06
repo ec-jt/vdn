@@ -81,17 +81,30 @@ def merge_lora_state(model, state, scale=1.0):
     """Fold peft-named `.lora_A. / .lora_B.` pairs into the model, in place.
     Returns the number of pairs merged."""
     params = dict(model.named_parameters())
-    merged = 0
+    # Validate every pair before mutating weights. In particular, add_ would
+    # silently broadcast a malformed singleton-row/column delta into the target.
+    pairs = []
     for name, a in state.items():
+        if ".lora_B." in name and name.replace(".lora_B.", ".lora_A.") not in state:
+            raise ValueError(f"Incomplete LoRA pair: {name}")
         if ".lora_A." not in name:
             continue
-        b = state[name.replace(".lora_A.", ".lora_B.")]
+        b_name = name.replace(".lora_A.", ".lora_B.")
+        if b_name not in state:
+            raise ValueError(f"Incomplete LoRA pair: {name}")
+        b = state[b_name]
         target = name.split(".lora_A.")[0] + ".weight"
         w = _resolve(params, target)
+        if (a.ndim != 2 or b.ndim != 2 or w.ndim != 2 or a.shape[0] == 0
+                or b.shape[1] != a.shape[0]
+                or (b.shape[0], a.shape[1]) != tuple(w.shape)):
+            raise ValueError(f"Wrong LoRA shapes for {target}: A={tuple(a.shape)}, "
+                             f"B={tuple(b.shape)}, weight={tuple(w.shape)}")
+        pairs.append((a, b, w))
+    for a, b, w in pairs:
         delta = (b.to(torch.float32) @ a.to(torch.float32)) * scale
         w.data.add_(delta.to(w.device, w.dtype))
-        merged += 1
-    return merged
+    return len(pairs)
 
 
 def load_external_lora(path, alpha=None):

@@ -1,0 +1,58 @@
+# Research only. Prior numerical rejections are not superseded by this preset.
+# Run through benchmark_rtx5090_paper_stack.sh to reserve fresh output paths.
+checkpoint: ../models/OpenVDN/vdn-minimax-h3/stage-dmd-step-250
+base_source: ../models/OpenVDN/vdn-minimax-h3/h3-base
+vae_source: ../models/OpenVDN/vdn-minimax-h3/h3-base
+external_loras: []
+memory:
+  policy: resident_weight_shards
+  local_files_only: true
+  shard_world_size: 8
+  scatter_chunk_mib: 32
+  shard_distribution: broadcast
+  weight_prefetch: true
+kernels:
+  inference_kernels: false
+  softmax_backend: flex
+  vda_fused: false
+  vda_overlap: false
+precision:
+  dtype: bfloat16
+  fp8:
+    enabled: false
+    skip_end_blocks: 4
+compute:
+  paper_mxfp8: true
+  paper_qk_rope: true
+  paper_window: true
+  paper_vda: true
+  paper_vda_overlap: true
+  paper_adaln: true
+  paper_fused_block: true
+  paper_max_gather_rows: 65536
+  paper_max_query_rows: 8192
+  paper_adaln_table_mib: 256
+parallel:
+  softmax_ranks: 0
+  standard_exchange: allgather
+  profile: false
+  timeout_seconds: 600
+behavior:
+  teacher_mode: false
+ablation:
+  enabled: false
+  overrides: {}
+render:
+  prompt_file: prompts/example_0.pt
+  out: artifacts/rtx5090/paper-stack-20261005/integration/LAUNCHER_REQUIRED/render.mp4
+  latents_root: artifacts/rtx5090/paper-stack-20261005/integration/LAUNCHER_REQUIRED/latents
+  device: cuda:0
+  num_frames: 124
+  num_steps: 8
+  warmup_steps: 0
+  seed: 42
+  video_shift: 12.0
+  audio_shift: 3.0
+  save_latents: true
+  denoise_only: false
+  record: true

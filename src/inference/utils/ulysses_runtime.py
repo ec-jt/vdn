@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import timedelta
 from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
+
+from src.inference.utils.nsight import nvtx_annotate, nvtx_range
 
 
 def sequence_splits(sequence_length: int, world_size: int) -> tuple[int, ...]:
@@ -134,6 +137,9 @@ class UlyssesRuntime:
     profile_enabled: bool = False
     softmax_dispatch_group: object | None = None
     linear_dispatch_group: object | None = None
+    standard_exchange: str = "alltoall"
+    # Explicit request owner. Never inferred from global kernel state.
+    paper_runtime: object | None = None
     profile_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = field(
         default_factory=dict
     )
@@ -200,6 +206,8 @@ class UlyssesRuntime:
         return sum(splits[:branch_rank])
 
     def enable_branch_parallel(self, softmax_ranks: int) -> None:
+        if self.standard_exchange != "alltoall":
+            raise ValueError("standard_exchange=broadcast does not support branch parallelism")
         if not 0 < softmax_ranks < self.world_size:
             raise ValueError(
                 f"softmax_ranks must lie in [1, {self.world_size - 1}], got {softmax_ranks}"
@@ -209,6 +217,10 @@ class UlyssesRuntime:
         self.softmax_ranks = softmax_ranks
 
     def configure(self, sequence_length: int, num_heads: int) -> None:
+        if self.standard_exchange not in ("alltoall", "broadcast", "allgather"):
+            raise ValueError("standard_exchange must be alltoall, broadcast or allgather")
+        if self.branch_parallel and self.standard_exchange != "alltoall":
+            raise ValueError("standard_exchange=broadcast does not support branch parallelism")
         if not self.branch_parallel and num_heads % self.world_size:
             raise ValueError(
                 f"Ulysses needs num_heads divisible by world_size; got "
@@ -238,6 +250,7 @@ class UlyssesRuntime:
         else:
             self.heads_per_rank = num_heads // self.world_size
 
+    @nvtx_annotate('inputexchange.branches')
     def dispatch_fields_to_branches_overlapped(
         self,
         softmax_q: torch.Tensor,
@@ -258,127 +271,133 @@ class UlyssesRuntime:
         shared_width = linear_shared.shape[-1]
 
         profile_event = self.profile_start()
-        soft_input_splits = [0] * self.world_size
-        soft_specs = []
-        soft_first = 0
-        for target, heads in enumerate(self.softmax_head_splits):
-            row_width = heads * per_head
-            size = local_rows * row_width
-            soft_input_splits[target] = size
-            soft_specs.append((soft_first, heads, row_width, size))
-            soft_first += heads
-        soft_send = value.new_empty(sum(soft_input_splits))
-        offset = 0
-        for first_head, heads, row_width, size in soft_specs:
-            _pack_branch_target_kernel[
-                (local_rows, triton.cdiv(row_width, 256))
-            ](
-                softmax_q,
-                softmax_k,
-                value,
-                softmax_gate,
-                linear_shared,
-                soft_send[offset : offset + size],
-                local_rows,
-                NUM_HEADS=self.num_heads,
-                HEAD_DIM=head_dim,
-                FIRST_HEAD=first_head,
-                LOCAL_HEADS=heads,
-                SHARED_WIDTH=shared_width,
-                LINEAR=False,
-                BLOCK=256,
-                num_warps=4,
+        with nvtx_range("inputexchange.pack.softmax"):
+            soft_input_splits = [0] * self.world_size
+            soft_specs = []
+            soft_first = 0
+            for target, heads in enumerate(self.softmax_head_splits):
+                row_width = heads * per_head
+                size = local_rows * row_width
+                soft_input_splits[target] = size
+                soft_specs.append((soft_first, heads, row_width, size))
+                soft_first += heads
+            soft_send = value.new_empty(sum(soft_input_splits))
+            offset = 0
+            for first_head, heads, row_width, size in soft_specs:
+                _pack_branch_target_kernel[
+                    (local_rows, triton.cdiv(row_width, 256))
+                ](
+                    softmax_q,
+                    softmax_k,
+                    value,
+                    softmax_gate,
+                    linear_shared,
+                    soft_send[offset : offset + size],
+                    local_rows,
+                    NUM_HEADS=self.num_heads,
+                    HEAD_DIM=head_dim,
+                    FIRST_HEAD=first_head,
+                    LOCAL_HEADS=heads,
+                    SHARED_WIDTH=shared_width,
+                    LINEAR=False,
+                    BLOCK=256,
+                    num_warps=4,
+                )
+                offset += size
+            soft_row_width = (
+                self.branch_heads * per_head if self.branch_kind == "softmax" else 0
             )
-            offset += size
-        soft_row_width = (
-            self.branch_heads * per_head if self.branch_kind == "softmax" else 0
-        )
-        soft_output_splits = [rows * soft_row_width for rows in self.splits]
-        soft_recv = value.new_empty(sum(soft_output_splits))
-        soft_work = dist.all_to_all_single(
-            soft_recv,
-            soft_send,
-            output_split_sizes=soft_output_splits,
-            input_split_sizes=soft_input_splits,
-            group=self.softmax_dispatch_group,
-            async_op=True,
-        )
+            soft_output_splits = [rows * soft_row_width for rows in self.splits]
+            soft_recv = value.new_empty(sum(soft_output_splits))
+        with nvtx_range("inputexchange.transport.softmax.launch"):
+            soft_work = dist.all_to_all_single(
+                soft_recv,
+                soft_send,
+                output_split_sizes=soft_output_splits,
+                input_split_sizes=soft_input_splits,
+                group=self.softmax_dispatch_group,
+                async_op=True,
+            )
 
-        linear_input_splits = [0] * self.world_size
-        linear_specs = []
-        linear_first = 0
-        for branch_rank, heads in enumerate(self.linear_head_splits):
-            target = self.softmax_ranks + branch_rank
-            row_width = heads * per_head + shared_width
-            size = local_rows * row_width
-            linear_input_splits[target] = size
-            linear_specs.append((linear_first, heads, row_width, size))
-            linear_first += heads
-        linear_send = value.new_empty(sum(linear_input_splits))
-        offset = 0
-        for first_head, heads, row_width, size in linear_specs:
-            _pack_branch_target_kernel[
-                (local_rows, triton.cdiv(row_width, 256))
-            ](
-                linear_q,
-                linear_k,
-                value,
-                linear_beta,
-                linear_shared,
-                linear_send[offset : offset + size],
-                local_rows,
-                NUM_HEADS=self.num_heads,
-                HEAD_DIM=head_dim,
-                FIRST_HEAD=first_head,
-                LOCAL_HEADS=heads,
-                SHARED_WIDTH=shared_width,
-                LINEAR=True,
-                BLOCK=256,
-                num_warps=4,
+        with nvtx_range("inputexchange.pack.VDA"):
+            linear_input_splits = [0] * self.world_size
+            linear_specs = []
+            linear_first = 0
+            for branch_rank, heads in enumerate(self.linear_head_splits):
+                target = self.softmax_ranks + branch_rank
+                row_width = heads * per_head + shared_width
+                size = local_rows * row_width
+                linear_input_splits[target] = size
+                linear_specs.append((linear_first, heads, row_width, size))
+                linear_first += heads
+            linear_send = value.new_empty(sum(linear_input_splits))
+            offset = 0
+            for first_head, heads, row_width, size in linear_specs:
+                _pack_branch_target_kernel[
+                    (local_rows, triton.cdiv(row_width, 256))
+                ](
+                    linear_q,
+                    linear_k,
+                    value,
+                    linear_beta,
+                    linear_shared,
+                    linear_send[offset : offset + size],
+                    local_rows,
+                    NUM_HEADS=self.num_heads,
+                    HEAD_DIM=head_dim,
+                    FIRST_HEAD=first_head,
+                    LOCAL_HEADS=heads,
+                    SHARED_WIDTH=shared_width,
+                    LINEAR=True,
+                    BLOCK=256,
+                    num_warps=4,
+                )
+                offset += size
+            self.profile_end("branch_pack", profile_event)
+            linear_row_width = (
+                self.branch_heads * per_head + shared_width
+                if self.branch_kind == "linear"
+                else 0
             )
-            offset += size
-        self.profile_end("branch_pack", profile_event)
-        linear_row_width = (
-            self.branch_heads * per_head + shared_width
-            if self.branch_kind == "linear"
-            else 0
-        )
-        linear_output_splits = [rows * linear_row_width for rows in self.splits]
-        linear_recv = value.new_empty(sum(linear_output_splits))
-        linear_work = dist.all_to_all_single(
-            linear_recv,
-            linear_send,
-            output_split_sizes=linear_output_splits,
-            input_split_sizes=linear_input_splits,
-            group=self.linear_dispatch_group,
-            async_op=True,
-        )
+            linear_output_splits = [rows * linear_row_width for rows in self.splits]
+            linear_recv = value.new_empty(sum(linear_output_splits))
+        with nvtx_range("inputexchange.transport.VDA.launch"):
+            linear_work = dist.all_to_all_single(
+                linear_recv,
+                linear_send,
+                output_split_sizes=linear_output_splits,
+                input_split_sizes=linear_input_splits,
+                group=self.linear_dispatch_group,
+                async_op=True,
+            )
 
         profile_event = self.profile_start()
-        if self.branch_kind == "softmax":
-            soft_work.wait()
-            recv = soft_recv.view(self.sequence_length, soft_row_width)
-            packed = recv.view(
-                self.sequence_length,
-                self.branch_heads,
-                per_head,
-            )
-            shared = None
-            pending = (linear_work, linear_send, linear_recv)
-        else:
-            linear_work.wait()
-            recv = linear_recv.view(self.sequence_length, linear_row_width)
-            head_payload = self.branch_heads * per_head
-            packed = recv[:, :head_payload].view(
-                self.sequence_length,
-                self.branch_heads,
-                per_head,
-            )
-            shared = recv[:, head_payload:]
-            pending = (soft_work, soft_send, soft_recv)
+        with nvtx_range("inputexchange.wait.relevant_branch"):
+            if self.branch_kind == "softmax":
+                soft_work.wait()
+                recv = soft_recv.view(self.sequence_length, soft_row_width)
+                packed = recv.view(
+                    self.sequence_length,
+                    self.branch_heads,
+                    per_head,
+                )
+                shared = None
+                pending = (linear_work, linear_send, linear_recv)
+            else:
+                linear_work.wait()
+                recv = linear_recv.view(self.sequence_length, linear_row_width)
+                head_payload = self.branch_heads * per_head
+                packed = recv[:, :head_payload].view(
+                    self.sequence_length,
+                    self.branch_heads,
+                    per_head,
+                )
+                shared = recv[:, head_payload:]
+                pending = (soft_work, soft_send, soft_recv)
         self.profile_end("branch_relevant_wait", profile_event)
         return packed, shared, pending
 
+    @nvtx_annotate('outputexchange.branches')
     def branches_to_sequence(self, branch_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return disjoint branch/head shards to all eight sequence owners in one A2A.
 
@@ -404,77 +423,165 @@ class UlyssesRuntime:
 
         recv = branch_tensor.new_empty(sum(output_splits))
         profile_event = self.profile_start()
-        dist.all_to_all_single(
-            recv,
-            branch_tensor.contiguous().view(-1),
-            output_split_sizes=output_splits,
-            input_split_sizes=input_splits,
-        )
+        with nvtx_range("outputexchange.pack.alltoall"):
+            send = branch_tensor.contiguous().view(-1)
+        with nvtx_range("outputexchange.transport.alltoall"):
+            dist.all_to_all_single(
+                recv,
+                send,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+            )
+        del send
         self.profile_end("output_a2a", profile_event)
 
         profile_event = self.profile_start()
-        chunks = []
-        offset = 0
-        for size, heads in zip(output_splits, self.branch_head_splits):
-            chunks.append(recv[offset : offset + size].view(local_rows, heads, width))
-            offset += size
-        softmax = torch.cat(chunks[: self.softmax_ranks], dim=1)
-        linear = torch.cat(chunks[self.softmax_ranks :], dim=1)
+        with nvtx_range("outputexchange.unpack.branches"):
+            chunks = []
+            offset = 0
+            for size, heads in zip(output_splits, self.branch_head_splits):
+                chunks.append(recv[offset : offset + size].view(local_rows, heads, width))
+                offset += size
+            softmax = torch.cat(chunks[: self.softmax_ranks], dim=1)
+            linear = torch.cat(chunks[self.softmax_ranks :], dim=1)
         self.profile_end("output_unpack", profile_event)
         return softmax, linear
 
+    @nvtx_annotate('inputexchange.standard')
     def sequence_to_heads(self, tensor: torch.Tensor) -> torch.Tensor:
-        """[S_rank, H, D] -> [S, H/P, D] with one all-to-all."""
+        """[S_rank, H, D] -> [S, H/P, D], exact standard routing."""
         local_rows, heads, width = tensor.shape
         if local_rows != self.splits[self.rank]:
             raise ValueError(f"local rows {local_rows} != configured {self.splits[self.rank]}")
         if heads != self.heads_per_rank * self.world_size:
             raise ValueError(f"heads {heads} != {self.heads_per_rank * self.world_size}")
 
-        send = (
-            tensor.view(local_rows, self.world_size, self.heads_per_rank, width)
-            .permute(1, 0, 2, 3)
-            .contiguous()
-            .view(-1)
-        )
+        if self.standard_exchange == "allgather":
+            if self.branch_parallel:
+                raise ValueError("allgather exchange requires standard Ulysses")
+            max_rows = max(self.splits)
+            with nvtx_range("inputexchange.pack.allgather"):
+                source = tensor.new_zeros((max_rows, heads, width))
+                source[:local_rows].copy_(tensor)
+                gathered = tensor.new_empty((self.world_size * max_rows, heads, width))
+            with nvtx_range("inputexchange.transport.allgather"):
+                dist.all_gather_into_tensor(gathered, source)
+            with nvtx_range("inputexchange.unpack.allgather"):
+                output = tensor.new_empty((self.sequence_length, self.heads_per_rank, width))
+                first_head = self.rank * self.heads_per_rank
+                offset = 0
+                for rank, rows in enumerate(self.splits):
+                    output[offset:offset + rows].copy_(
+                        gathered[rank * max_rows:rank * max_rows + rows,
+                                 first_head:first_head + self.heads_per_rank])
+                    offset += rows
+            return output
+
+        if self.standard_exchange == "broadcast":
+            if self.branch_parallel:
+                raise ValueError("broadcast exchange requires standard Ulysses")
+            # One reusable source buffer, never a replicated full-sequence pack.
+            source = tensor.new_empty((max(self.splits), heads, width))
+            output = tensor.new_empty((self.sequence_length, self.heads_per_rank, width))
+            first_head = self.rank * self.heads_per_rank
+            offset = 0
+            for rank, rows in enumerate(self.splits):
+                payload = source[:rows]
+                if rank == self.rank:
+                    with nvtx_range("inputexchange.pack.broadcast"):
+                        payload.copy_(tensor)
+                with nvtx_range("inputexchange.transport.broadcast"):
+                    dist.broadcast(payload, src=rank)
+                with nvtx_range("inputexchange.unpack.broadcast"):
+                    output[offset:offset + rows].copy_(
+                        payload[:, first_head:first_head + self.heads_per_rank])
+                offset += rows
+            return output
+
+        with nvtx_range("inputexchange.pack.alltoall"):
+            send = (
+                tensor.view(local_rows, self.world_size, self.heads_per_rank, width)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+                .view(-1)
+            )
         unit = self.heads_per_rank * width
         input_splits = [local_rows * unit] * self.world_size
         output_splits = [rows * unit for rows in self.splits]
         recv = tensor.new_empty(sum(output_splits))
-        dist.all_to_all_single(
-            recv,
-            send,
-            output_split_sizes=output_splits,
-            input_split_sizes=input_splits,
-        )
+        with nvtx_range("inputexchange.transport.alltoall"):
+            dist.all_to_all_single(
+                recv,
+                send,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+            )
         return recv.view(self.sequence_length, self.heads_per_rank, width)
 
+    @nvtx_annotate('outputexchange.standard')
     def heads_to_sequence(self, tensor: torch.Tensor) -> torch.Tensor:
-        """[S, H/P, D] -> [S_rank, H, D] with one all-to-all."""
+        """[S, H/P, D] -> [S_rank, H, D], exact standard routing."""
         sequence_length, local_heads, width = tensor.shape
         if sequence_length != self.sequence_length or local_heads != self.heads_per_rank:
             raise ValueError(
                 f"head shard has {tuple(tensor.shape[:2])}, expected "
                 f"({self.sequence_length}, {self.heads_per_rank})"
             )
+        if self.standard_exchange == "allgather":
+            if self.branch_parallel:
+                raise ValueError("allgather exchange requires standard Ulysses")
+            with nvtx_range("outputexchange.pack.allgather"):
+                source = tensor.contiguous()
+                gathered = tensor.new_empty((self.world_size * sequence_length, local_heads, width))
+            with nvtx_range("outputexchange.transport.allgather"):
+                dist.all_gather_into_tensor(gathered, source)
+            with nvtx_range("outputexchange.unpack.allgather"):
+                output = tensor.new_empty((self.splits[self.rank], self.num_heads, width))
+                for rank in range(self.world_size):
+                    output[:, rank * local_heads:(rank + 1) * local_heads].copy_(
+                        gathered[rank * sequence_length + self.local_start:
+                                 rank * sequence_length + self.local_end])
+            return output
+        if self.standard_exchange == "broadcast":
+            if self.branch_parallel:
+                raise ValueError("broadcast exchange requires standard Ulysses")
+            source = tensor.new_empty(tensor.shape)
+            output = tensor.new_empty((self.splits[self.rank], self.num_heads, width))
+            for rank in range(self.world_size):
+                if rank == self.rank:
+                    with nvtx_range("outputexchange.pack.broadcast"):
+                        source.copy_(tensor)
+                with nvtx_range("outputexchange.transport.broadcast"):
+                    dist.broadcast(source, src=rank)
+                with nvtx_range("outputexchange.unpack.broadcast"):
+                    first_head = rank * self.heads_per_rank
+                    output[:, first_head:first_head + self.heads_per_rank].copy_(
+                        source[self.local_start:self.local_end])
+            return output
         unit = self.heads_per_rank * width
         input_splits = [rows * unit for rows in self.splits]
         local_rows = self.splits[self.rank]
         output_splits = [local_rows * unit] * self.world_size
         recv = tensor.new_empty(sum(output_splits))
-        dist.all_to_all_single(
-            recv,
-            tensor.contiguous().view(-1),
-            output_split_sizes=output_splits,
-            input_split_sizes=input_splits,
-        )
-        return (
-            recv.view(self.world_size, local_rows, self.heads_per_rank, width)
-            .permute(1, 0, 2, 3)
-            .contiguous()
-            .view(local_rows, self.heads_per_rank * self.world_size, width)
-        )
+        with nvtx_range("outputexchange.pack.alltoall"):
+            send = tensor.contiguous().view(-1)
+        with nvtx_range("outputexchange.transport.alltoall"):
+            dist.all_to_all_single(
+                recv,
+                send,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+            )
+        del send
+        with nvtx_range("outputexchange.unpack.alltoall"):
+            return (
+                recv.view(self.world_size, local_rows, self.heads_per_rank, width)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+                .view(local_rows, self.heads_per_rank * self.world_size, width)
+            )
 
+    @nvtx_annotate('outputexchange.gather_sequence')
     def gather_sequence(self, tensor: torch.Tensor) -> torch.Tensor:
         """All-gather a sequence shard, with at most P-1 padded rows."""
         local_rows = tensor.shape[0]
@@ -485,7 +592,8 @@ class UlyssesRuntime:
         else:
             padded = tensor
         gathered = tensor.new_empty((self.world_size * max_rows, *tensor.shape[1:]))
-        dist.all_gather_into_tensor(gathered, padded.contiguous())
+        with nvtx_range("outputexchange.transport.allgather"):
+            dist.all_gather_into_tensor(gathered, padded.contiguous())
 
         # The production split has every short/padded shard last, hence valid rows are
         # one prefix.  Retain a correct fallback for very short unit-test geometries.
@@ -494,32 +602,49 @@ class UlyssesRuntime:
         chunks = gathered.view(self.world_size, max_rows, *tensor.shape[1:])
         return torch.cat([chunks[r, :n] for r, n in enumerate(self.splits)], dim=0)
 
+    @nvtx_annotate('VDA.frame_mean.local')
     def _local_video_frame_sums(self, local_x: torch.Tensor, layout) -> torch.Tensor:
+        """Deterministic per-frame FP32 sums of this rank's video rows.
+
+        Frame rows are contiguous in the packed sequence, so every overlapped frame
+        is summed as one contiguous slice. This replaces an atomic ``index_add_``
+        whose accumulation order -- and therefore the FP32 rounding seed handed to
+        the trajectory -- varied run to run (measured ~1e-8 relative on the sums,
+        which the denoising loop amplified to O(0.27) at the 124-frame endpoint).
+        The sums are mathematically identical to the atomic version, only reproducible.
+        """
         sums = torch.zeros(
             layout.num_frames,
             local_x.shape[-1],
             device=local_x.device,
             dtype=torch.float32,
         )
-        positions = torch.arange(self.local_start, self.local_end, device=local_x.device)
-        is_video = (positions >= layout.video_start) & (positions < layout.video_end)
-        if is_video.any():
-            frames = torch.div(
-                positions[is_video] - layout.video_start,
-                layout.tokens_per_frame,
-                rounding_mode="floor",
-            )
-            sums.index_add_(0, frames, local_x[is_video].float())
+        v0, v1 = layout.video_start, layout.video_end
+        lo = max(self.local_start, v0)
+        hi = min(self.local_end, v1)
+        if hi <= lo:
+            return sums
+        tpf = layout.tokens_per_frame
+        xf = local_x.float()
+        first_frame = (lo - v0) // tpf
+        last_frame = (hi - 1 - v0) // tpf
+        for frame in range(first_frame, last_frame + 1):
+            a = max(lo, v0 + frame * tpf)
+            b = min(hi, v0 + (frame + 1) * tpf)
+            sums[frame] = xf[a - self.local_start:b - self.local_start].sum(dim=0)
         return sums
 
+    @nvtx_annotate('VDA.frame_mean.launch')
     def video_frame_mean_async(self, local_x: torch.Tensor, layout):
         """Launch the frame-sum all-reduce so QKV, gates and dispatch can hide it."""
         sums = self._local_video_frame_sums(local_x, layout)
-        work = dist.all_reduce(sums, async_op=True)
+        with nvtx_range("VDA.frame_mean.transport.launch"):
+            work = dist.all_reduce(sums, async_op=True)
         return sums, work
 
 
-def init_ulysses(backend: str = "nccl", *, profile_enabled: bool = False) -> UlyssesRuntime:
+def init_ulysses(backend: str = "nccl", *, profile_enabled: bool = False,
+                 timeout_seconds: int = 600) -> UlyssesRuntime:
     """Initialise the torchrun process group and bind this process to LOCAL_RANK.
 
     ``profile_enabled`` (config ``parallel.profile``) records CUDA events around every
@@ -535,7 +660,7 @@ def init_ulysses(backend: str = "nccl", *, profile_enabled: bool = False) -> Uly
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(backend=backend, timeout=timedelta(seconds=timeout_seconds))
     rank = dist.get_rank()
     actual_world = dist.get_world_size()
     if actual_world != world_size:
@@ -550,6 +675,8 @@ def init_ulysses(backend: str = "nccl", *, profile_enabled: bool = False) -> Uly
     )
 
     ranks = list(range(actual_world))
-    runtime.softmax_dispatch_group = dist.new_group(ranks=ranks, backend=backend)
-    runtime.linear_dispatch_group = dist.new_group(ranks=ranks, backend=backend)
+    runtime.softmax_dispatch_group = dist.new_group(ranks=ranks, backend=backend,
+                                                    timeout=timedelta(seconds=timeout_seconds))
+    runtime.linear_dispatch_group = dist.new_group(ranks=ranks, backend=backend,
+                                                   timeout=timedelta(seconds=timeout_seconds))
     return runtime

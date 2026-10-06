@@ -13,3 +13,6 @@ __pycache__/
 # fetched by scripts/setup_diffusers.sh (upstream pin + diffusers_patches/)
 diffusers/
 *.egg-info/
+
+# local benchmark captures and kernel caches (multi-GB; files exceed GitHub limits)
+artifacts/

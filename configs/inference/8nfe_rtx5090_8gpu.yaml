@@ -1,0 +1,33 @@
+# Eight resident weight shards plus standard eight-way Ulysses, no branch split.
+# Rank zero full CPU baseline assembly, NOT strict block-bounded CPU assembly.
+checkpoint: ../models/OpenVDN/vdn-minimax-h3/stage-dmd-step-250
+base_source: ../models/OpenVDN/vdn-minimax-h3/h3-base
+vae_source: ../models/OpenVDN/vdn-minimax-h3/h3-base
+memory:
+  policy: resident_weight_shards
+  local_files_only: true
+  shard_world_size: 8
+  scatter_chunk_mib: 32
+kernels:
+  inference_kernels: false
+  softmax_backend: flex
+precision:
+  dtype: bfloat16
+  fp8:
+    enabled: false
+parallel:
+  softmax_ranks: 0
+  profile: true
+  timeout_seconds: 600
+render:
+  prompt_file: prompts/example_0.pt
+  out: results/8nfe_rtx5090_8gpu.mp4
+  num_frames: 124
+  num_steps: 8
+  warmup_steps: 0
+  seed: 42
+  video_shift: 12.0
+  audio_shift: 3.0
+  save_latents: true
+  denoise_only: false
+  record: true

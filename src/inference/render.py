@@ -3,6 +3,8 @@ the denoising loop) and decode_and_save with its atomic .partial.mp4 write.
 """
 import os
 import time
+from contextlib import nullcontext
+from functools import wraps
 from types import SimpleNamespace
 
 import torch
@@ -17,6 +19,7 @@ from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
 from diffusers.utils.export_utils import encode_video
 
 from src.inference.utils.prompt_cache import is_reference_request
+from src.inference.utils.nsight import nvtx_annotate, nvtx_range
 from src.models.sequence_layout import layout_from_indices
 from src.models.hybrid_transform import iter_hybrids, set_layout
 
@@ -29,10 +32,27 @@ PIXEL_MEAN, PIXEL_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 KEYFRAME_NOISE_AUG = 0.999
 
 
+def _paper_request_cleanup(fn):
+    @wraps(fn)
+    def wrapped(transformer, *args, **kwargs):
+        paper = getattr(transformer, "_paper_runtime", None)
+        try:
+            return fn(transformer, *args, **kwargs)
+        except BaseException:
+            if paper is not None:
+                paper.state = "failed"
+            raise
+        finally:
+            if paper is not None:
+                paper.close_tables()
+    return wrapped
+
+
 @torch.no_grad()
+@_paper_request_cleanup
 def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, num_steps, seed, device,
                      video_shift=12.0, audio_shift=3.0, runtime=None, step_seconds=None,
-                     conditions=None):
+                     conditions=None, metrics=None, nsight_capture=None):
     """The sampler. `runtime` (Ulysses) adds a barrier before and after the loop so every
     rank enters and leaves together; `step_seconds`, if a list, receives the
     device-synchronised wall time of every NFE (for the timing log and the record).
@@ -95,6 +115,12 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
     audio_scheduler = MiniMaxH3Scheduler(shift=audio_shift)
     scheduler.set_timesteps(num_steps + 1, device=device)
     audio_scheduler.set_timesteps(num_steps + 1, device=device)
+    paper = getattr(transformer, "_paper_runtime", None)
+    if paper is not None:
+        paper.begin(next(iter_hybrids(transformer)).layout, num_condition_rows,
+                    scheduler.timesteps, audio_scheduler.timesteps,
+                    frames=num_frames, steps=num_steps, seed=seed,
+                    shifts=(video_shift, audio_shift))
 
     generator = torch.Generator(device).manual_seed(seed)
     # The conditioning noise is drawn first, one draw per keyframe or reference, before
@@ -120,36 +146,43 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
         torch.cuda.synchronize(device)
 
     seq_len = position_ids.shape[0]
-    for t, audio_t in zip(scheduler.timesteps, audio_scheduler.timesteps):
+    for step_index, (t, audio_t) in enumerate(zip(scheduler.timesteps, audio_scheduler.timesteps)):
         step_started = time.perf_counter()
-        row_timesteps = torch.full((seq_len,), float(t), dtype=torch.float32, device=device)
-        if num_condition_rows:
-            row_timesteps[video_indices[:num_condition_rows]] = max(float(t), KEYFRAME_NOISE_AUG)
-        row_timesteps[audio_indices] = float(audio_t)
-        timestep, timestep_indices = torch.unique(row_timesteps, sorted=True, return_inverse=True)
-        noise_pred, audio_noise_pred = transformer(
-            hidden_states=video_rows[None],
-            audio_hidden_states=audio_rows[None],
-            encoder_hidden_states=prompt_embeds[None],
-            timestep=timestep,
-            timestep_indices=timestep_indices,
-            token_tags=token_tags,
-            position_ids=position_ids,
-            video_indices=video_indices,
-            audio_indices=audio_indices,
-            text_indices=text_indices,
-            return_dict=False,
-        )
-        # only the generated rows step; the anchors ride through unchanged
-        video_rows[num_condition_rows:] = scheduler.step(
-            noise_pred[0, num_condition_rows:].float(), t, video_rows[num_condition_rows:],
-            return_dict=False)[0]
-        audio_rows = audio_scheduler.step(audio_noise_pred[0].float(), audio_t, audio_rows, return_dict=False)[0]
+        step_range = (nsight_capture.step(step_index, last=step_index == num_steps - 1)
+                      if nsight_capture is not None else nvtx_range(f"denoise.step.{step_index}"))
+        with step_range, metrics.denoise_step(step_index) if metrics else nullcontext():
+            row_timesteps = torch.full((seq_len,), float(t), dtype=torch.float32, device=device)
+            if num_condition_rows:
+                row_timesteps[video_indices[:num_condition_rows]] = max(float(t), KEYFRAME_NOISE_AUG)
+            row_timesteps[audio_indices] = float(audio_t)
+            timestep, timestep_indices = torch.unique(row_timesteps, sorted=True, return_inverse=True)
+            noise_pred, audio_noise_pred = transformer(
+                hidden_states=video_rows[None],
+                audio_hidden_states=audio_rows[None],
+                encoder_hidden_states=prompt_embeds[None],
+                timestep=timestep,
+                timestep_indices=timestep_indices,
+                token_tags=token_tags,
+                position_ids=position_ids,
+                video_indices=video_indices,
+                audio_indices=audio_indices,
+                text_indices=text_indices,
+                return_dict=False,
+            )
+            # only the generated rows step; the anchors ride through unchanged
+            video_rows[num_condition_rows:] = scheduler.step(
+                noise_pred[0, num_condition_rows:].float(), t, video_rows[num_condition_rows:],
+                return_dict=False)[0]
+            audio_rows = audio_scheduler.step(audio_noise_pred[0].float(), audio_t, audio_rows, return_dict=False)[0]
+            if paper is not None:
+                paper.guard.check("scheduler_output", video_rows, audio_rows)
 
         if step_seconds is not None:
             torch.cuda.synchronize(device)
             step_seconds.append(time.perf_counter() - step_started)
 
+    if paper is not None:
+        paper.finish()
     if runtime is not None:
         torch.cuda.synchronize(device)
         runtime.barrier()
@@ -164,9 +197,8 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
 
 
 @torch.no_grad()
-def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, device: str):
-    vae.to(device)
-    audio_vae.to(device)
+@nvtx_annotate("decode.video")
+def _decode_video(latents, vae, device):
     latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
     latents_std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
     with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -174,13 +206,58 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
     pixel_mean = torch.tensor(PIXEL_MEAN, device=device).view(1, -1, 1, 1, 1)
     pixel_std = torch.tensor(PIXEL_STD, device=device).view(1, -1, 1, 1, 1)
     video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+    return (video[0].permute(1, 2, 3, 0) * 255).round().to(torch.uint8).cpu()
 
+
+@torch.no_grad()
+@nvtx_annotate("decode.audio")
+def _decode_audio(audio_latents, audio_vae, device):
     audio_latents_mean = torch.tensor(audio_vae.config.latents_mean, device=device).view(1, -1, 1)
     audio_latents_std = torch.tensor(audio_vae.config.latents_std, device=device).view(1, -1, 1)
     audio = audio_vae.decode(audio_latents * audio_latents_std + audio_latents_mean, return_dict=False)[0]
-    audio = audio.float().permute(1, 0, 2)[0]  # (2, num_samples)
+    return audio.float().permute(1, 0, 2)[0].cpu()  # (2, num_samples)
 
-    frames = (video[0].permute(1, 2, 3, 0) * 255).round().to(torch.uint8).cpu()  # (F, H, W, 3)
+
+@torch.no_grad()
+def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, device: str,
+                    *, sequential=False, offload=None, metrics=None):
+    """Opt-in staging releases denoiser weights, then decodes one VAE at a time.
+
+    CPU outputs and evicted VAEs survive repeated renders. Each decoder is evicted
+    even on failure. Legacy callers retain their existing simultaneous residency.
+    Phase times include onload, decode, result transfer, and eviction.
+    """
+    phase = metrics.phase if metrics else (lambda *args: nullcontext())
+    if sequential:
+        if offload is None:
+            raise ValueError("sequential decode requires a denoiser offload controller")
+        with phase("release_denoiser"):
+            offload.release()
+            # Also makes repeated calls safe if a caller moved either decoder.
+            vae.to("cpu")
+            audio_vae.to("cpu")
+            torch.cuda.empty_cache()
+        with phase("video_decode"):
+            try:
+                vae.to(device)
+                frames = _decode_video(latents, vae, device)
+            finally:
+                vae.to("cpu")
+                torch.cuda.empty_cache()
+        with phase("audio_decode"):
+            try:
+                audio_vae.to(device)
+                audio = _decode_audio(audio_latents, audio_vae, device)
+            finally:
+                audio_vae.to("cpu")
+                torch.cuda.empty_cache()
+    else:
+        vae.to(device)
+        audio_vae.to(device)
+        with phase("video_decode"):
+            frames = _decode_video(latents, vae, device)
+        with phase("audio_decode"):
+            audio = _decode_audio(audio_latents, audio_vae, device)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     # Encode to a sibling temp name and rename into place, so a render that is killed
@@ -192,7 +269,8 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
     # output format". Same directory either way, which is what os.replace needs.
     stem, ext = os.path.splitext(out_path)
     partial_path = f"{stem}.partial{ext}"
-    encode_video(frames, fps=FPS, output_path=partial_path,
-                 audio=audio.cpu(), audio_sample_rate=audio_vae.config.sampling_rate)
-    os.replace(partial_path, out_path)
+    with nvtx_range("decode.output.media_mux"), phase("media_encode"):
+        encode_video(frames, fps=FPS, output_path=partial_path,
+                     audio=audio, audio_sample_rate=audio_vae.config.sampling_rate)
+        os.replace(partial_path, out_path)
     print(f"wrote {out_path}", flush=True)

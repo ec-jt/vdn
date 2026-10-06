@@ -136,6 +136,11 @@ With MXFP8, denoising takes 47.6, 25.9, 13.1, and 6.9 seconds on 1, 2, 4, and 8 
 
 The configs, kernels, fp8, the eight-GPU layout and the prompt caches are described in [docs/inference.md](docs/inference.md).
 
+For single-RTX-5090 BF16 rendering with existing local weights, whole-block CPU
+offload, measured memory/timings, and the separate optional prompt encoder, see
+the [RTX 5090 operational guide](docs/rtx5090.md). This opt-in path leaves the
+legacy configurations unchanged and is not distributed inference.
+
 #### Download the weights
 
 To render through this repository's own stack instead -- fp8, the tuned kernels, and Ulysses across eight GPUs, which is where the numbers in [Results](#results) come from -- download everything (about 82 GB) from [Hugging Face](https://huggingface.co/OpenVDN/vdn-minimax-h3) into `ckpts/` using

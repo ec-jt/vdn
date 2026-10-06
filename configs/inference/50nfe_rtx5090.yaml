@@ -1,0 +1,31 @@
+# Stage-B counterpart of 50nfe.yaml: same 50-step scheduler and shifts.
+# Guidance-distilled H3 uses one conditional forward per step, no CFG branch.
+# Stage-B contains its own default adapter, not the Stage-DMD turbo adapter.
+# Local BF16 baseline only. Canvas remains 768x1344; shorter default bounds memory.
+checkpoint: ../models/OpenVDN/vdn-minimax-h3/stage-b-step-2000
+base_source: ../models/OpenVDN/vdn-minimax-h3/h3-base
+vae_source: ../models/OpenVDN/vdn-minimax-h3/h3-base
+
+memory:
+  policy: cpu_block_offload
+  local_files_only: true
+
+kernels:
+  inference_kernels: false
+  softmax_backend: flex
+
+precision:
+  dtype: bfloat16
+  fp8:
+    enabled: false
+
+render:
+  prompt_file: prompts/example_2.pt
+  out: results/50nfe_rtx5090.mp4
+  device: cuda:0
+  num_frames: 124
+  num_steps: 50
+  warmup_steps: 0
+  video_shift: 12.0
+  audio_shift: 3.0
+  record: true

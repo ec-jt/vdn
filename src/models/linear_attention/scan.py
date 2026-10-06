@@ -16,7 +16,7 @@ import contextlib
 
 import torch
 
-def frame_statistics(kf, vf, beta, a_fp32=True, inference=False):
+def frame_statistics(kf, vf, beta, a_fp32=True, inference=False, fused_prep=False):
     """Per-frame delta-rule statistics, shared by the branch and its test.
 
         A[f,h,k,l] = sum_s k[f,h,s,k] beta[f,h,s] k[f,h,s,l]
@@ -39,7 +39,8 @@ def frame_statistics(kf, vf, beta, a_fp32=True, inference=False):
     keeps the A statistics exact there.
     """
     with torch.autocast(device_type=kf.device.type, enabled=False):
-        return _frame_statistics(kf, vf, beta, a_fp32, inference=inference)
+        return _frame_statistics(kf, vf, beta, a_fp32, inference=inference,
+                                 fused_prep=fused_prep)
 
 
 _STATS_PREP_CACHE = {}
@@ -118,27 +119,32 @@ def _frame_stats_prep(kf, vf, beta, inference=False):
     return out
 
 
-def _frame_statistics(kf, vf, beta, a_fp32, inference=False):
-    """Inference takes the frames STATS_CHUNK_FRAMES at a time into preallocated A and B,
+def _frame_statistics(kf, vf, beta, a_fp32, inference=False, fused_prep=False):
+    """No-grad evaluation takes STATS_CHUNK_FRAMES at a time into preallocated A and B,
     so the four prologue operands exist for one chunk rather than the whole clip: same
     per-frame GEMMs (each frame is its own batch entry either way), only the batch
-    count cuBLAS sees changes. Training keeps the single pass: chunking would add a
-    graph node per chunk for no memory the backward could use."""
+    count cuBLAS sees changes. This also bounds eager offloaded evaluation without
+    enabling fused kernels or TF32. Training keeps the single pass: chunking would
+    add a graph node per chunk for no memory the backward could use."""
     num_frames = kf.shape[0]
-    if not inference or num_frames <= STATS_CHUNK_FRAMES:
-        return _frame_statistics_pass(kf, vf, beta, a_fp32, inference=inference)
+    if (not inference and torch.is_grad_enabled()) or num_frames <= STATS_CHUNK_FRAMES:
+        return _frame_statistics_pass(kf, vf, beta, a_fp32, inference=inference,
+                                      fused_prep=fused_prep)
     heads, dk, dv = kf.shape[1], kf.shape[-1], vf.shape[-1]
     A = kf.new_empty((num_frames, heads, dk, dk), dtype=torch.float32)
     B = kf.new_empty((num_frames, heads, dv, dk), dtype=torch.float32)
     for start in range(0, num_frames, STATS_CHUNK_FRAMES):
         stop = min(start + STATS_CHUNK_FRAMES, num_frames)
         A[start:stop], B[start:stop] = _frame_statistics_pass(
-            kf[start:stop], vf[start:stop], beta[start:stop], a_fp32, inference=True)
+            kf[start:stop], vf[start:stop], beta[start:stop], a_fp32, inference=inference,
+            fused_prep=fused_prep)
     return A, B
 
 
-def _frame_statistics_pass(kf, vf, beta, a_fp32, inference=False):
-    kf, kf32, scaled32, vb = _frame_stats_prep(kf, vf, beta, inference=inference)
+def _frame_statistics_pass(kf, vf, beta, a_fp32, inference=False, fused_prep=False):
+    # Targeted VDA fusion changes operand preparation only, not GEMM precision.
+    kf, kf32, scaled32, vb = _frame_stats_prep(
+        kf, vf, beta, inference=inference or fused_prep)
     if a_fp32:
         # A IN FP32, B LEFT IN BF16. A is the one the scan inverts, and bf16 breaks a
         # property it needs. A = sum_s beta_s k_s k_s^T is symmetric by construction, but
@@ -394,5 +400,3 @@ def _gather_body(prefix_states, suffix_states, alpha, text_state, bridge_alpha, 
         out = (state_before * has_before.view(-1, 1, 1, 1)
                + state_after * has_after.view(-1, 1, 1, 1))
     return out if out_dtype is None else out.to(out_dtype)
-
-

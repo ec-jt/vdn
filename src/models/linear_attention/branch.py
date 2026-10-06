@@ -9,16 +9,17 @@ from src.models.attention_gates import OutputGate
 from src.models.linear_attention.delta_rule import DELTA_BACKENDS
 from src.checkpoints.key_mapping import SHORT_CONV_TARGETS
 from src.models.linear_attention.features import (LinearAttentionSepConv,
+                                                  _activate_body, _temporal_conv,
                                                   prepare_linear_features,
                                                   prepare_linear_features_inference)
-from src.models.linear_attention.kernels import linear_epilogue
+from src.models.linear_attention.kernels import linear_epilogue, vda_bf16_epilogue
 from src.models.linear_attention.layers import FrameKDAAlpha, RMSNorm
 from src.models.linear_attention.scan import (BRIDGE_MODES, frame_statistics,
                                               gather_linear_state, _run_scans,
                                               _run_scans_inference)
 
 class _HeadSliceSepConv:
-    """A head range of the branch's separable conv, for the inference body under Ulysses:
+    """A head range of the branch's separable conv, for either body under Ulysses:
     the same weights read through a channel slice, so `prepare_linear_features_inference`
     sees an object with the conv's interface (`projs`, `KERNEL`, `spatial`) and nothing
     else changes. The module itself is untouched."""
@@ -95,6 +96,15 @@ class BidirectionalLinearBranch(nn.Module):
         # no block checkpointing, and with short_conv the saved conv+SiLU+L2Norm chain
         # adds a few GiB to every per-layer student re-run.
         self.checkpoint_features = False
+        # Experimental, independent of the model-wide inference kernel switch.
+        # Only boundary gather and BF16-rounded epilogue are fused. Statistics prep
+        # was measured separately and rejected for production124 latency regression.
+        # Features, FP32 alpha/inverse/scans and the text state stay on the reference.
+        self.inference_vda_kernels = False
+        # Independent full paper-stack experiment. Never inferred from a global
+        # inference flag, and never silently falls back to the old branch body.
+        self.paper_vda_enabled = False
+        self.paper_vda_chunk_size = 8
 
     def _features(self, qkv_raw, num_frames=None, frame_size=None, inference=False,
                   query_fhsd=None, heads=None):
@@ -129,7 +139,8 @@ class BidirectionalLinearBranch(nn.Module):
                     self._feature_one, tokens, proj, num_frames, frame_size,
                     use_reentrant=False))
             else:
-                outs.append(self._feature_one(tokens, proj, num_frames, frame_size))
+                outs.append(self._feature_one(tokens, proj, num_frames, frame_size,
+                                              heads=heads))
         return tuple(outs)
 
     def _feature_one(self, tokens, proj, num_frames, frame_size, use_conv=True,
@@ -142,7 +153,18 @@ class BidirectionalLinearBranch(nn.Module):
         the one the video frames feed."""
         conv = self.short_conv if use_conv else None
         if conv is not None and heads is not None:
-            conv = _HeadSliceSepConv(conv, heads, self.head_dim)   # inference, Ulysses
+            conv = _HeadSliceSepConv(conv, heads, self.head_dim)
+            if not inference and proj in conv.projs:
+                # Head-sharded Ulysses must run the SAME short-conv kernel as the
+                # single-rank reference. The reference reaches the conv through
+                # prepare_linear_features -> _temporal_conv (inductor-compiled on
+                # CUDA); an earlier version called eager _temporal_shift here, which
+                # is numerically close but NOT identical (measured ~8.5e-3 rel L2
+                # per branch call at bf16) and inflated trajectory drift. Both conv
+                # weights stay head-sliced.
+                x, weight = conv.spatial(proj, tokens, num_frames, frame_size)
+                out = _temporal_conv(x, weight, conv.KERNEL, conv.KERNEL // 2)
+                return _activate_body(out.reshape_as(tokens), l2norm=(proj != "v"))
         features = prepare_linear_features_inference if inference else prepare_linear_features
         return features(tokens, l2norm=(proj != "v"), conv=conv, proj=proj,
                         num_frames=num_frames, frame_size=frame_size, fhsd=fhsd)
@@ -215,6 +237,22 @@ class BidirectionalLinearBranch(nn.Module):
             _, injection = backend.factor_apply(ones, A, B)
         return injection[0]                                                # [H,d_v,d_k]
 
+    def _validate_sharded(self, heads, beta, gate, frame_mean, text_beta, text_qkv_raw):
+        """Owner-supplied inputs are a forward-only contract, not a training API."""
+        if any(v is not None for v in (heads, beta, gate, frame_mean, text_beta)):
+            if torch.is_grad_enabled():
+                raise RuntimeError("head-sharded/precomputed branch inputs require "
+                                   "torch.no_grad(); distributed training is not supported")
+        if heads is not None:
+            if (not isinstance(heads, slice) or heads.step not in (None, 1)
+                    or not isinstance(heads.start, int) or not isinstance(heads.stop, int)
+                    or not 0 <= heads.start < heads.stop <= self.num_heads):
+                raise ValueError("heads must be a bounded contiguous slice within num_heads")
+            if beta is None or gate is None or frame_mean is None:
+                raise ValueError("head-sharded calls require beta, gate, and frame_mean")
+            if text_qkv_raw is not None and text_beta is None:
+                raise ValueError("head-sharded text_qkv_raw requires text_beta")
+
     def forward(self, xv, num_frames, tokens_per_frame, bounds, qkv_raw,
                 frame_size=None, skip_ends=False, text_x=None, text_qkv_raw=None,
                 inference=False, heads=None, beta=None, gate=None, frame_mean=None,
@@ -261,6 +299,13 @@ class BidirectionalLinearBranch(nn.Module):
         NOTHING here is arithmetic: the anchor case is a slice, a rebase and a scatter,
         and both cases then run the SAME `_readout`. That split is deliberate — see the
         comment on _readout for why the boundary between the two lives exactly here.
+
+        heads: explicit contiguous slice of the original heads. Both bodies accept
+            head-local qkv_raw, beta [F*S,H_local], gate [F*S,H_local,d], and the
+            full-hidden-width FP32 frame_mean [F,hidden]; xv may then be None.
+            Text likewise uses head-local text_qkv_raw/text_beta. These supplied
+            inputs require no_grad even for inference=False, which selects the
+            untuned reference body, not a distributed training implementation.
         """
 
         # WHICH ALGORITHM BODY -- an explicit argument, not ambient state.
@@ -273,11 +318,43 @@ class BidirectionalLinearBranch(nn.Module):
         # switch to the fused kernels, including a teacher whose whole job is to be
         # numerically comparable to the student.
         #
-        # `inference` is the intent. grad-enabled is still the correctness precondition,
+        # `inference` selects optimized kernels. A head-sharded reference call is
+        # also forward-only, but deliberately keeps inference=False.
+        # Grad-enabled is still the correctness precondition,
         # and the two disagreeing is a bug in the caller, not a case to resolve: the
         # inference body writes into preallocated banks (see _run_scans_inference) and
         # HybridAttention adds its readout in place, neither of which a graph survives.
         # So say so, rather than quietly picking one.
+        if self.paper_vda_enabled:
+            if torch.compiler.is_compiling():
+                raise RuntimeError("paper VDA is an eager inference API; compile is unsupported")
+            if inference or self.inference_vda_kernels:
+                raise ValueError("paper_vda_enabled is exclusive with inference=True "
+                                 "and inference_vda_kernels")
+            if torch.is_grad_enabled():
+                raise RuntimeError("paper_vda_enabled requires torch.no_grad()")
+            if (self.delta_rule != "vdn_solve" or not self.a_fp32
+                    or self.head_dim != 128 or self.bridge not in ("alpha", "none")):
+                raise ValueError("paper VDA requires vdn_solve, a_fp32, head_dim=128")
+            if (not isinstance(self.paper_vda_chunk_size, int)
+                    or isinstance(self.paper_vda_chunk_size, bool)
+                    or self.paper_vda_chunk_size < 1):
+                raise ValueError("paper_vda_chunk_size must be a positive integer")
+            if any(t.device.type != "cuda" or t.dtype != torch.bfloat16 for t in qkv_raw):
+                raise ValueError("paper VDA branch requires CUDA BF16 Q/K/V")
+        if self.inference_vda_kernels:
+            if inference:
+                raise ValueError("inference_vda_kernels requires inference=False; "
+                                 "do not combine with global inference_kernels")
+            if torch.is_grad_enabled():
+                raise RuntimeError("inference_vda_kernels requires torch.no_grad()")
+            if (self.delta_rule != "vdn_solve" or not self.a_fp32
+                    or self.head_dim != 128 or self.bridge != "alpha"):
+                raise ValueError("inference_vda_kernels requires vdn_solve, a_fp32, "
+                                 "head_dim=128 and bridge=alpha")
+            if any(t.device.type != "cuda" or t.dtype != torch.bfloat16
+                   for t in qkv_raw):
+                raise ValueError("inference_vda_kernels requires CUDA BF16 Q/K/V")
         if inference and torch.is_grad_enabled():
             raise RuntimeError(
                 "inference=True inside an enabled-grad region. The inference body is "
@@ -287,14 +364,16 @@ class BidirectionalLinearBranch(nn.Module):
                 "hybrid_transform.set_inference_mode(model, True).")
         # The Ulysses inference case hands in what this rank cannot compute itself
         # (its head range; beta, the output gate and the frame mean, which the sequence
-        # owner computed from `xv` before dispatch). Inference-body only, by design.
+        # owner computed from `xv` before dispatch). Either algorithm body can use
+        # these, but neither exposes distributed autograd through this interface.
         sharded = dict(heads=heads, beta=beta, gate=gate, frame_mean=frame_mean,
                        text_beta=text_beta)
-        if any(v is not None for v in sharded.values()) and not inference:
-            raise ValueError("heads/beta/gate/frame_mean/text_beta are inference-only "
-                             "(the training body derives them from xv)")
-        run_readout = ((lambda *a: self._readout_inference(*a, **sharded))
-                       if inference else self._readout)
+        self._validate_sharded(heads, beta, gate, frame_mean, text_beta, text_qkv_raw)
+        readout_body = self._readout_inference if inference else self._readout
+        if self.paper_vda_enabled:
+            from src.models.linear_attention.paper_stack import paper_readout
+            readout_body = lambda *a, **kw: paper_readout(self, *a, **kw)
+        run_readout = lambda *a: readout_body(*a, **sharded)
         n_heads = self.num_heads if heads is None else heads.stop - heads.start
         ref = xv if xv is not None else gate      # dtype/device for the empty rows
 
@@ -305,11 +384,10 @@ class BidirectionalLinearBranch(nn.Module):
             out = ref.new_zeros(num_frames * tokens_per_frame, n_heads * self.head_dim)
         else:
             inner = slice(tokens_per_frame, (num_frames - 1) * tokens_per_frame)
-            if inference:
-                sharded.update(
-                    beta=None if beta is None else beta[inner],
-                    gate=None if gate is None else gate[inner],
-                    frame_mean=None if frame_mean is None else frame_mean[1:-1])
+            sharded.update(
+                beta=None if beta is None else beta[inner],
+                gate=None if gate is None else gate[inner],
+                frame_mean=None if frame_mean is None else frame_mean[1:-1])
             readout = run_readout(
                 None if xv is None else xv[inner], num_frames - 2, tokens_per_frame,
                 [(lo - 1, hi - 1) for lo, hi in bounds[1:num_frames - 1]],   # rebased
@@ -324,7 +402,8 @@ class BidirectionalLinearBranch(nn.Module):
         return out
 
     def _readout(self, xv, num_frames, tokens_per_frame, bounds, qkv_raw,
-                 frame_size=None, text_x=None, text_qkv_raw=None):
+                 frame_size=None, text_x=None, text_qkv_raw=None, heads=None,
+                 beta=None, gate=None, frame_mean=None, text_beta=None):
         """The branch algorithm itself, over exactly the frames it owns.
 
         NO skip_ends parameter, on purpose: this function has no notion of anchors, and
@@ -337,45 +416,70 @@ class BidirectionalLinearBranch(nn.Module):
         early return added to the algorithm cannot skip the scatter and leave the two
         anchor frames holding garbage instead of zero.
         """
+        self._validate_sharded(heads, beta, gate, frame_mean, text_beta, text_qkv_raw)
         num_tokens = num_frames * tokens_per_frame
-        heads, head_dim = self.num_heads, self.head_dim
+        head_slice = heads
+        heads = self.num_heads if heads is None else heads.stop - heads.start
+        head_dim = self.head_dim
+        ref = xv if xv is not None else gate
         backend = self._delta_backend("backend", tokens_per_frame)
         shape_per_frame = (num_frames, tokens_per_frame, heads, head_dim)
 
         # --- 1. features ------------------------------------------------------------
-        query, key, value = self._features(qkv_raw, num_frames, frame_size)  # [F*S, H, d]
+        query, key, value = self._features(qkv_raw, num_frames, frame_size,
+                                           heads=head_slice)              # [F*S, H, d]
         query_by_frame = query.view(shape_per_frame)                     # [F, S, H, d]
         key_by_frame = key.view(shape_per_frame).permute(0, 2, 1, 3)     # [F, H, S, d]
         value_by_frame = value.view(shape_per_frame).permute(0, 2, 1, 3)
-        beta = torch.sigmoid(self.beta_proj(xv))                         # [F*S, H]
+        if beta is None:
+            beta = torch.sigmoid(self.beta_proj(xv))                     # [F*S, H]
         beta = beta.view(num_frames, tokens_per_frame, heads).permute(0, 2, 1)  # [F,H,S]
 
         # --- 2. collapse each frame's S tokens into two d x d matrices ---------------
         A, B = frame_statistics(key_by_frame, value_by_frame, beta,
                                 a_fp32=self.a_fp32)                      # [F,H,d,d]
+        # No later operation reads these features. In no-grad evaluation retaining
+        # them through normalization needlessly holds several GiB for long clips;
+        # autograd retains any tensors its backward needs independently.
+        del key, value, key_by_frame, value_by_frame, beta
 
         # dtype=fp32 on the mean, not just inside alpha: xv is bf16, so without it the
         # frame mean is rounded to bf16 BEFORE reaching the fp32 island, and `.float()`
         # in there cannot recover what the mean already threw away.
-        alpha = self.alpha(xv.view(num_frames, tokens_per_frame, -1)
-                           .mean(dim=1, dtype=torch.float32))
+        if frame_mean is None:
+            frame_mean = xv.view(num_frames, tokens_per_frame, -1).mean(
+                dim=1, dtype=torch.float32)
+        alpha = self.alpha(frame_mean, heads=head_slice)
 
         # --- 0/3. scans: prefix_states[t] = frames 0..t, suffix_states[t] = frames t..F-1
         # Seeded with half the text state when the prompt was handed in, so both
         # directions start from the prompt rather than from nothing.
-        text_state = self._text_state(text_x, text_qkv_raw)
+        text_state = self._text_state(text_x, text_qkv_raw,
+                                      heads=head_slice, text_beta=text_beta)
         prefix_states, suffix_states = _run_scans(backend, alpha, A, B,
                                                   text_state=text_state)
 
         # --- 4. boundary gather: the complement of the softmax window, brought to t
         linear_state = gather_linear_state(prefix_states, suffix_states, alpha, bounds,
-                                     bridge=self.bridge, text_state=text_state).to(xv.dtype)
+                                     bridge=self.bridge, text_state=text_state,
+                                     inference=self.inference_vda_kernels,
+                                     out_dtype=(ref.dtype if self.inference_vda_kernels
+                                                else None)).to(ref.dtype)
+        del prefix_states, suffix_states, alpha, A, B, text_state
 
         # --- 5. read out with the query, then normalise and gate ---------------------
         readout = torch.einsum("fhvk,fshk->fshv", linear_state, query_by_frame)
+        del linear_state, query_by_frame, query
 
-        readout = self.norm(readout.reshape(num_tokens, heads, head_dim))
-        return (readout * self.output_gate(xv)).reshape(num_tokens, heads * head_dim)
+        readout = readout.reshape(num_tokens, heads, head_dim)
+        if self.inference_vda_kernels:
+            if gate is None:
+                gate = self.output_gate(xv)
+            return vda_bf16_epilogue(readout, self.norm.weight, gate, self.norm.eps)
+        readout = self.norm(readout)
+        if gate is None:
+            gate = self.output_gate(xv)
+        return (readout * gate).reshape(num_tokens, heads * head_dim)
 
     def _readout_inference(self, xv, num_frames, tokens_per_frame, bounds, qkv_raw,
                            frame_size=None, text_x=None, text_qkv_raw=None, heads=None,
@@ -400,15 +504,16 @@ class BidirectionalLinearBranch(nn.Module):
         share every line and drift only in the branches nobody reads. A further
         difference goes here -- with a line saying why, and with its own error budget.
 
-        THE THIRD DIFFERENCE: the body can run on a HEAD RANGE. Branch-parallel Ulysses
+        Both bodies can run on a HEAD RANGE. Branch-parallel Ulysses
         gives each linear rank all rows of `heads` = slice(a, b) heads, plus `beta`,
         `gate` and `frame_mean` computed by the sequence owner (this rank has no `xv`),
         and `text_beta` for the prompt rows. Every parameter read below then takes the
         head slice (conv channels, alpha's up/dt_bias/A_log; the norm weight is per
-        head_dim and shared by all heads, so it stays whole); the arithmetic is
-        unchanged, so a full run's output[:, a:b] equals the sliced run to fp32 rounding
-        (the compiled kernels re-tune for the sliced shapes, which changes reduction
-        order). None of it exists in `_readout`.
+        head_dim and shared by all heads, so it stays whole). The math is independent
+        across heads, but shape-dependent kernel selection and reduction order can
+        change rounding, including BF16 stores. The reference body retains eager
+        feature, scan and epilogue operations;
+        head slicing is not a bitwise parity guarantee for either body.
         """
         num_tokens = num_frames * tokens_per_frame
         head_dim = self.head_dim
@@ -456,4 +561,3 @@ class BidirectionalLinearBranch(nn.Module):
         # The norm is RMSNorm(head_dim), one weight vector shared by every head: no slice.
         return linear_epilogue(readout, self.norm.weight, gate, self.norm.eps,
                              inference=True, fhsd=True)
-

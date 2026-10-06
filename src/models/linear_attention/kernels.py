@@ -1,6 +1,8 @@
 """Inference-only fused epilogue: RMSNorm + output gate in one pass."""
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 _LINEAR_EPILOGUE_CACHE = {}
 
@@ -57,4 +59,49 @@ def linear_epilogue(readout, weight, gate, eps, inference=False, fhsd=False):
 
     return out
 
+
+@triton.jit
+def _vda_bf16_epilogue_kernel(X, W, G, Y, N: tl.constexpr, H: tl.constexpr,
+                              XS0: tl.constexpr, XS1: tl.constexpr,
+                              GS0: tl.constexpr, GS1: tl.constexpr,
+                              EPS: tl.constexpr, D: tl.constexpr):
+    row = tl.program_id(0) * 4 + tl.arange(0, 4)
+    col = tl.arange(0, D)
+    x = tl.load(X + (row // H)[:, None] * XS0 + (row % H)[:, None] * XS1
+                + col[None, :], row[:, None] < N, 0).to(tl.float32)
+    # Preserve the eager BF16 rounding boundaries instead of rounding once at store.
+    norm = tl.sqrt(tl.sum(x * x, 1))
+    ms = norm * norm / D
+    inv = tl.rsqrt(ms + EPS).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(W + col).to(tl.bfloat16).to(tl.float32)
+    gate = tl.load(G + (row // H)[:, None] * GS0 + (row % H)[:, None] * GS1
+                   + col[None, :], row[:, None] < N, 0).to(tl.float32)
+    y = (x * inv[:, None]).to(tl.bfloat16).to(tl.float32)
+    y = (y * w[None, :]).to(tl.bfloat16).to(tl.float32)
+    tl.store(Y + row[:, None] * D + col[None, :], y * gate, row[:, None] < N)
+
+
+def vda_bf16_epilogue(readout, weight, gate, eps):
+    """Experimental CUDA BF16 RMSNorm/gate fusion, retaining eager cast boundaries.
+
+    Token/head strides may be noncontiguous (including packed Ulysses gates).
+    FP32 reduction order can still differ from ATen; this is not a bitwise promise.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError("vda_bf16_epilogue requires torch.no_grad()")
+    if (readout.ndim != 3 or readout.shape[-1] != 128
+            or gate.shape != readout.shape or weight.shape != (128,)):
+        raise ValueError("expected readout/gate [tokens, heads, 128] and weight [128]")
+    if (readout.dtype != torch.bfloat16 or gate.dtype != torch.bfloat16
+            or not readout.is_cuda or gate.device != readout.device
+            or weight.device != readout.device or readout.stride(-1) != 1
+            or gate.stride(-1) != 1 or not weight.is_contiguous()):
+        raise ValueError("expected CUDA BF16 readout/gate with contiguous last dimension")
+    tokens, heads, dim = readout.shape
+    out = torch.empty((tokens, heads * dim), device=readout.device, dtype=readout.dtype)
+    _vda_bf16_epilogue_kernel[(triton.cdiv(tokens * heads, 4),)](
+        readout, weight, gate, out, tokens * heads, heads,
+        *readout.stride()[:2], *gate.stride()[:2], eps, dim,
+        num_warps=4, enable_fp_fusion=False)
+    return out
 
